@@ -450,10 +450,9 @@ class Utilities:
         title = Utilities.get_text(user_id, title_key, **kwargs)
         content = Utilities.get_text(user_id, content_key, **kwargs)
         settings = DatabaseManager.get_settings()
-        name = settings.get('bot_name', 'Hosting Bot')
+        name = settings.get('bot_name', 'ZEUS')
         return (f"┌─⊷『 {title} 』\n│\n├ {content}\n│\n└─⊷ <b>{name}</b>\n"
-                f"<code>White Wolf t.me/j49_c</code>\n"
-                f"<code>channel t.me/bshshshkk</code>\n{HIDDEN_LONG}")
+                f"<code>ZEUS</code>\n{HIDDEN_LONG}")
 
     @staticmethod
     def delete_last_message(chat_id):
@@ -973,7 +972,7 @@ TRANSLATIONS = {
 def init_database():
     global db
     client = pymongo.MongoClient(MONGODB_URI)
-    db = client.get_default_database()
+    db = client.get_database('zeus_database')
 
     default_channels = [
         {"username": "@F7_7G", "name": "F7_7G"},
@@ -989,7 +988,7 @@ def init_database():
     if 'channels' not in settings:
         settings['channels'] = default_channels
     defaults = {
-        "bot_name": "Hosting Bot",
+        "bot_name": "ZEUS",
         "bot_image": None,
         "file_thumb": None,
         "bot_locked": False,
@@ -1742,7 +1741,7 @@ def settings_panel(call, uid):
     has_img = "✅" if settings.get('bot_image') else "❌"
     has_thumb = "✅" if settings.get('file_thumb') and os.path.exists(settings.get('file_thumb', '')) else "❌"
     auto_approve = "✅" if settings.get('auto_approve', True) else "❌"
-    text = (Utilities.get_text(uid, 'bot_name', name=settings.get('bot_name', 'Not set')) + '\n' +
+    text = (Utilities.get_text(uid, 'bot_name', name=settings.get('bot_name', 'ZEUS')) + '\n' +
             Utilities.get_text(uid, 'bot_image', state=has_img) + '\n' +
             Utilities.get_text(uid, 'file_thumb', state=has_thumb) + '\n' +
             Utilities.get_text(uid, 'auto_approve', state=auto_approve))
@@ -2874,8 +2873,8 @@ threading.Thread(target=monitoring_loop, daemon=True).start()
 init_database()
 
 print("=" * 40)
-print("Hosting Bot | White Wolf t.me/j49_c")
-print("channel t.me/bshshshkk")
+print("ZEUS Hosting Bot")
+print("Powered by ZEUS")
 print("=" * 40)
 
 while True:
