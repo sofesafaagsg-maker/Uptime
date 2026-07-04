@@ -53,8 +53,8 @@ if not MONGODB_URI:
     print("Error: MONGODB_URI environment variable is not set.")
     sys.exit(1)
 
-TOKEN = 'توكنك'
-ADMIN_ID = 6812997550
+TOKEN = '8695092791:AAEASb3MvFTEWyoZOCwJG1DYV2v6bvr2Nts'
+ADMIN_ID = 306626795
 HIDDEN_LONG = "ㅤ" * 50
 bot = telebot.TeleBot(TOKEN, threaded=True, parse_mode="HTML")
 
