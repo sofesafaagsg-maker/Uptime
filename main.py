@@ -452,7 +452,7 @@ class Utilities:
         settings = DatabaseManager.get_settings()
         name = settings.get('bot_name', 'ZEUS')
         return (f"┌─⊷『 {title} 』\n│\n├ {content}\n│\n└─⊷ <b>{name}</b>\n"
-                f"<code>ZEUS</code>\n{HIDDEN_LONG}")
+                f"{HIDDEN_LONG}")
 
     @staticmethod
     def delete_last_message(chat_id):
@@ -2879,7 +2879,7 @@ print("=" * 40)
 
 while True:
     try:
-        bot.infinity_polling(timeout=60, long_polling_timeout=60)
+        bot.infinity_polling(timeout=20, long_polling_timeout=20, skip_pending=True)
     except Exception as e:
         print(f"Polling error: {e}")
         time.sleep(5)
