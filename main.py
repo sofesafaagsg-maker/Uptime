@@ -14,6 +14,7 @@ import hashlib
 import base64
 import shutil
 import psutil
+import io
 import resource
 from telebot import types
 from datetime import datetime, timedelta
@@ -83,6 +84,7 @@ active_processes = {}
 process_hours = {}
 user_notifications = {}
 process_resources = {}
+upload_sessions = {}  # uid -> { 'file_id', 'file_name', 'h_type', 'main_file' }
 
 RESOURCE_LIMITS = {
     'max_cpu_percent': 80,
@@ -353,12 +355,58 @@ class EncryptionManager:
             return None
 
     @staticmethod
+    def encrypt_binary(data: bytes, fid, user_id):
+        try:
+            file_key_info = EncryptionManager.generate_file_key(fid, user_id)
+            key = base64.b64decode(file_key_info['key'])
+            cipher = AES.new(key, AES.MODE_CBC)
+            ct_bytes = cipher.encrypt(pad(data, AES.block_size))
+            encrypted_data = {
+                'iv': base64.b64encode(cipher.iv).decode('utf-8'),
+                'ciphertext': base64.b64encode(ct_bytes).decode('utf-8'),
+                'fid': fid,
+                'user_id': user_id,
+                'timestamp': datetime.now().isoformat()
+            }
+            return json.dumps(encrypted_data).encode('utf-8')
+        except Exception as e:
+            print(f"Binary encryption error: {e}")
+            return None
+
+    @staticmethod
+    def decrypt_binary(encrypted_bytes: bytes, fid):
+        try:
+            data = json.loads(encrypted_bytes.decode('utf-8'))
+            file_key_info = EncryptionManager.get_file_key(fid)
+            if not file_key_info:
+                return None
+            key = base64.b64decode(file_key_info['key'])
+            iv = base64.b64decode(data['iv'])
+            ct = base64.b64decode(data['ciphertext'])
+            cipher = AES.new(key, AES.MODE_CBC, iv)
+            pt = unpad(cipher.decrypt(ct), AES.block_size)
+            return pt
+        except Exception as e:
+            print(f"Binary decryption error: {e}")
+            return None
+
+    @staticmethod
     def save_encrypted_file(fid, content, user_id):
         encrypted_content = EncryptionManager.encrypt_content(content, fid, user_id)
         if encrypted_content:
             encrypted_path = os.path.join(ENCRYPTED_DIR, f"{fid}.enc")
             with open(encrypted_path, 'w', encoding='utf-8') as f:
                 f.write(encrypted_content)
+            return True
+        return False
+
+    @staticmethod
+    def save_encrypted_binary_file(fid, data: bytes, user_id):
+        encrypted_data = EncryptionManager.encrypt_binary(data, fid, user_id)
+        if encrypted_data:
+            encrypted_path = os.path.join(ENCRYPTED_DIR, f"{fid}.enc")
+            with open(encrypted_path, 'wb') as f:
+                f.write(encrypted_data)
             return True
         return False
 
@@ -371,6 +419,15 @@ class EncryptionManager:
             return EncryptionManager.decrypt_content(encrypted_content, fid)
         return None
 
+    @staticmethod
+    def load_encrypted_binary_file(fid):
+        encrypted_path = os.path.join(ENCRYPTED_DIR, f"{fid}.enc")
+        if os.path.exists(encrypted_path):
+            with open(encrypted_path, 'rb') as f:
+                encrypted_data = f.read()
+            return EncryptionManager.decrypt_binary(encrypted_data, fid)
+        return None
+
 class ProcessManager:
     @staticmethod
     def start_script(fid):
@@ -381,27 +438,45 @@ class ProcessManager:
         user_id = file_info.get('user_id')
         if not Utilities.verify_file_access(fid, user_id):
             return False
-        encrypted_content = EncryptionManager.load_encrypted_file(fid)
-        if not encrypted_content:
-            return False
+
+        is_zip = file_info.get('file_format') == 'zip'
         env_dir = os.path.join(ENV_DIR, fid)
         if not os.path.exists(env_dir):
             os.makedirs(env_dir)
-        env_file_path = os.path.join(env_dir, f"{fid}.py")
+
         if fid in active_processes and active_processes[fid].poll() is None:
             return True
         if len(active_processes) >= RESOURCE_LIMITS['max_processes']:
             return False
+
         try:
-            with open(env_file_path, 'w', encoding='utf-8') as f:
-                f.write(encrypted_content)
-        except:
-            return False
-        log_path = os.path.join(LOGS_DIR, f"{fid}.log")
-        try:
+            if is_zip:
+                encrypted_data = EncryptionManager.load_encrypted_binary_file(fid)
+                if not encrypted_data:
+                    return False
+                zip_path = os.path.join(env_dir, f"{fid}.zip")
+                with open(zip_path, 'wb') as f:
+                    f.write(encrypted_data)
+                with zipfile.ZipFile(zip_path, 'r') as zf:
+                    zf.extractall(env_dir)
+                os.remove(zip_path)
+                main_file = file_info.get('main_file')
+                if not main_file or not os.path.exists(os.path.join(env_dir, main_file)):
+                    return False
+                entry_point = os.path.join(env_dir, main_file)
+            else:
+                encrypted_content = EncryptionManager.load_encrypted_file(fid)
+                if not encrypted_content:
+                    return False
+                env_file_path = os.path.join(env_dir, f"{fid}.py")
+                with open(env_file_path, 'w', encoding='utf-8') as f:
+                    f.write(encrypted_content)
+                entry_point = env_file_path
+
+            log_path = os.path.join(LOGS_DIR, f"{fid}.log")
             log_file = open(log_path, "a", encoding="utf-8")
             proc = subprocess.Popen(
-                [sys.executable, "-u", env_file_path],
+                [sys.executable, "-u", entry_point],
                 stdout=log_file,
                 stderr=log_file,
                 stdin=subprocess.PIPE,
@@ -417,7 +492,8 @@ class ProcessManager:
                 'memory_usage': 0
             }
             return True
-        except:
+        except Exception as e:
+            print(f"Start script error: {e}")
             return False
 
     @staticmethod
@@ -471,10 +547,9 @@ class ProcessManager:
             return None
 
 class Utilities:
-    # تخزين مؤقت لنتائج فحص الاشتراك
     _sub_cache = {}
     _sub_cache_lock = threading.Lock()
-    SUB_CACHE_TTL = 30  # ثانية
+    SUB_CACHE_TTL = 30
 
     @staticmethod
     def gen_id(length=8):
@@ -623,7 +698,6 @@ class Utilities:
     def check_subscription(user_id):
         if user_id == ADMIN_ID or Utilities.is_admin(user_id):
             return True
-        # استخدام التخزين المؤقت لتجنب طلبات API المتكررة
         now = time.time()
         with Utilities._sub_cache_lock:
             cached = Utilities._sub_cache.get(user_id)
@@ -1029,7 +1103,7 @@ TRANSLATIONS = {
     'next': {'en': 'Next', 'ar': 'التالي'},
     'locked': {'en': 'Locked', 'ar': 'مقفل'},
     'unlocked': {'en': 'Unlocked', 'ar': 'مفتوح'},
-    'enter_library_name': {'en': 'Enter the library name to install:', 'ar': 'أدخل اسم المكتبة للتثبيت:'},
+    'enter_library_name': {'en': 'Enter the library name(s) separated by commas:', 'ar': 'أدخل اسماء المكتبات مفصولة بفواصل:'},
     'enter_message': {'en': 'Enter the message to send:', 'ar': 'أدخل الرسالة للإرسال:'},
     'send_token': {'en': 'Send the new token:', 'ar': 'أرسل التوكن الجديد:'},
     'enter_name': {'en': 'Enter the new bot name:', 'ar': 'أدخل اسم البوت الجديد:'},
@@ -1060,7 +1134,20 @@ TRANSLATIONS = {
     'invalid_username': {'en': 'Invalid username.', 'ar': 'اسم المستخدم غير صالح.'},
     'time_expired': {'en': 'Time Expired', 'ar': 'انتهى الوقت'},
     'vip_removed': {'en': 'VIP removed.', 'ar': 'تم إزالة VIP.'},
+    'select_main_file': {'en': 'Select the main file to run:', 'ar': 'اختر الملف الرئيسي للتشغيل:'},
+    'zip_upload_invalid': {'en': 'Please send a valid .zip file.', 'ar': 'يرجى إرسال ملف zip صالح.'},
+    'zip_main_selected': {'en': 'Main file set to: {file}', 'ar': 'تم تعيين الملف الرئيسي: {file}'},
 }
+
+def install_saved_libraries():
+    settings = DatabaseManager.get_settings()
+    libs = settings.get('installed_libraries', [])
+    if libs:
+        print(f"Installing saved libraries: {libs}")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install"] + libs)
+        except Exception as e:
+            print(f"Failed to install some libraries: {e}")
 
 def init_database():
     global db
@@ -1085,7 +1172,8 @@ def init_database():
         "bot_image": None,
         "file_thumb": None,
         "bot_locked": False,
-        "auto_approve": True
+        "auto_approve": True,
+        "installed_libraries": []
     }
     for key, value in defaults.items():
         if key not in settings:
@@ -1103,6 +1191,8 @@ def init_database():
         security['master_key'] = master_key
         security['file_keys'] = {}
         DatabaseManager.save_security(security)
+
+    install_saved_libraries()
 
 def build_main_keyboard(uid):
     kb = types.InlineKeyboardMarkup(row_width=2)
@@ -1268,7 +1358,6 @@ def handle_callback(call):
         uid = call.from_user.id
         cid = call.message.chat.id
         data = call.data
-        # سيتم جلب البيانات من الذاكرة المؤقتة، لذا لا يوجد حمل إضافي
         users = DatabaseManager.get_users()
         settings = DatabaseManager.get_settings()
         if settings.get('bot_locked', False) and not Utilities.is_admin(uid):
@@ -1827,6 +1916,42 @@ def handle_callback(call):
                     bot.answer_callback_query(call.id, Utilities.get_text(uid, 'download_failed'), show_alert=True)
             else:
                 bot.answer_callback_query(call.id, Utilities.get_text(uid, 'no_files_to_download'), show_alert=True)
+        # معالجة اختيار الملف الرئيسي من zip
+        elif data.startswith("zipmain_"):
+            try:
+                parts = data.split("_")
+                idx = int(parts[1])
+                if uid not in upload_sessions:
+                    bot.answer_callback_query(call.id, "Session expired.")
+                    return
+                session = upload_sessions[uid]
+                zip_file_id = session.get('file_id')
+                if not zip_file_id:
+                    bot.answer_callback_query(call.id, "Invalid session.")
+                    return
+                file_info = bot.get_file(zip_file_id)
+                downloaded = bot.download_file(file_info.file_path)
+                zf = zipfile.ZipFile(io.BytesIO(downloaded))
+                names = zf.namelist()
+                if idx < 0 or idx >= len(names):
+                    bot.answer_callback_query(call.id, "Invalid selection.")
+                    return
+                main_file = names[idx]
+                session['main_file'] = main_file
+                bot.answer_callback_query(call.id, Utilities.get_text(uid, 'zip_main_selected', file=main_file))
+                h_type = session['h_type']
+                if h_type == "free":
+                    users = DatabaseManager.get_users()
+                    pts = users.get(str(uid), {}).get('points', 0)
+                    m = bot.send_message(cid, Utilities.format_border(uid, 'set_duration', Utilities.get_text(uid, 'duration_prompt', name=escape(session['file_name']), points=pts, max=pts)),
+                                         reply_markup=build_cancel_keyboard(uid))
+                    Utilities.save_message(cid, m.message_id)
+                    bot.register_next_step_handler(m, hours_step_zip, m.message_id, uid)
+                else:
+                    complete_upload_zip(uid, zip_file_id, h_type, 0, uid, main_file)
+            except Exception as e:
+                print(f"zipmain error: {e}")
+                bot.answer_callback_query(call.id, "Error processing zip.")
     except Exception as e:
         print(f"Callback error: {e}")
 
@@ -2317,21 +2442,128 @@ def upload_step(msg, h_type, prompt_id, uid):
         Utilities.clear_cancel(uid)
         return
     Utilities.delete_messages(msg.chat.id, prompt_id, msg.message_id)
-    if not msg.document or not msg.document.file_name.endswith('.py'):
+    if not msg.document:
         Utilities.send_message(msg.chat.id, uid, Utilities.format_border(uid, 'error', Utilities.get_text(uid, 'invalid_file')), build_back_keyboard(uid, "nav_upload"))
         return
-    if h_type == "free":
-        users = DatabaseManager.get_users()
-        pts = users.get(str(uid), {}).get('points', 0)
-        m = bot.send_message(
-            msg.chat.id,
-            Utilities.format_border(uid, 'set_duration', Utilities.get_text(uid, 'duration_prompt', name=escape(msg.document.file_name), points=pts, max=pts)),
-            reply_markup=build_cancel_keyboard(uid)
-        )
-        Utilities.save_message(msg.chat.id, m.message_id)
-        bot.register_next_step_handler(m, hours_step, msg.document, m.message_id, uid)
+    file_name = msg.document.file_name
+    if file_name.lower().endswith('.py'):
+        if h_type == "free":
+            users = DatabaseManager.get_users()
+            pts = users.get(str(uid), {}).get('points', 0)
+            m = bot.send_message(
+                msg.chat.id,
+                Utilities.format_border(uid, 'set_duration', Utilities.get_text(uid, 'duration_prompt', name=escape(file_name), points=pts, max=pts)),
+                reply_markup=build_cancel_keyboard(uid)
+            )
+            Utilities.save_message(msg.chat.id, m.message_id)
+            bot.register_next_step_handler(m, hours_step, msg.document, m.message_id, uid)
+        else:
+            complete_upload(msg.document, uid, h_type, 0, uid)
+    elif file_name.lower().endswith('.zip'):
+        zip_upload_step(msg, h_type, uid)
     else:
-        complete_upload(msg.document, uid, h_type, 0, uid)
+        Utilities.send_message(msg.chat.id, uid, Utilities.format_border(uid, 'error', Utilities.get_text(uid, 'invalid_file')), build_back_keyboard(uid, "nav_upload"))
+
+def zip_upload_step(msg, h_type, uid):
+    if not msg.document or not msg.document.file_name.endswith('.zip'):
+        Utilities.send_message(msg.chat.id, uid, Utilities.format_border(uid, 'error', Utilities.get_text(uid, 'zip_upload_invalid')), build_back_keyboard(uid, "nav_upload"))
+        return
+    try:
+        file_id = msg.document.file_id
+        file_info = bot.get_file(file_id)
+        downloaded = bot.download_file(file_info.file_path)
+        zf = zipfile.ZipFile(io.BytesIO(downloaded))
+        names = zf.namelist()
+        if not names:
+            bot.send_message(msg.chat.id, Utilities.format_border(uid, 'error', "Empty zip file."), reply_markup=build_back_keyboard(uid, "nav_upload"))
+            return
+        # تخزين معلومات الجلسة
+        upload_sessions[uid] = {
+            'file_id': file_id,
+            'file_name': msg.document.file_name,
+            'h_type': h_type
+        }
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        for idx, name in enumerate(names):
+            kb.add(Utilities.create_button(name, f"zipmain_{idx}", uid))
+        kb.add(Utilities.create_button(Utilities.get_text(uid, 'cancel'), "cancel", uid))
+        m = bot.send_message(msg.chat.id, Utilities.format_border(uid, 'select_main_file', Utilities.get_text(uid, 'select_main_file')), reply_markup=kb)
+        Utilities.save_message(msg.chat.id, m.message_id)
+    except Exception as e:
+        print(f"zip_upload_step error: {e}")
+        Utilities.send_message(msg.chat.id, uid, Utilities.format_border(uid, 'error', "Failed to process zip file."), build_back_keyboard(uid, "nav_upload"))
+
+def complete_upload_zip(uid, file_id, h_type, hours, original_uid, main_file):
+    fid = Utilities.gen_id()
+    try:
+        file_info = bot.get_file(file_id)
+        raw_bytes = bot.download_file(file_info.file_path)
+        if not EncryptionManager.save_encrypted_binary_file(fid, raw_bytes, uid):
+            Utilities.send_message(uid, uid, Utilities.format_border(uid, 'error', Utilities.get_text(uid, 'save_failed')), build_back_keyboard(uid))
+            return
+    except Exception as e:
+        print(f"Failed to download/encrypt zip: {e}")
+        Utilities.send_message(uid, uid, Utilities.format_border(uid, 'error', Utilities.get_text(uid, 'save_failed')), build_back_keyboard(uid))
+        return
+
+    files = DatabaseManager.get_files()
+    files[fid] = {
+        'user_id': uid,
+        'file_name': file_info.file_path.split('/')[-1] if hasattr(file_info, 'file_path') else 'archive.zip',
+        'type': h_type,
+        'status': 'pending',
+        'created_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'hours': hours,
+        'file_format': 'zip',
+        'main_file': main_file
+    }
+    DatabaseManager.save_files(files)
+
+    settings = DatabaseManager.get_settings()
+    if settings.get('auto_approve', True):
+        files[fid]['status'] = 'active'
+        if h_type == 'free' and hours > 0:
+            users = DatabaseManager.get_users()
+            if str(uid) in users:
+                users[str(uid)]['points'] -= hours
+                DatabaseManager.save_users(users)
+                process_hours[fid] = hours
+        DatabaseManager.save_files(files)
+        ProcessManager.start_script(fid)
+        duration = str(hours) + ' hour(s)' if h_type == 'free' else 'Unlimited'
+        text = Utilities.get_text(uid, 'file_accepted', name=files[fid]['file_name'], duration=duration)
+        Utilities.send_message(uid, uid, Utilities.format_border(uid, 'accepted', text), build_back_keyboard(uid))
+    else:
+        duration = str(hours) + ' hour(s)' if h_type == 'free' else ''
+        text = Utilities.get_text(uid, 'file_uploaded', name=files[fid]['file_name'], type='VIP' if h_type == 'pro' else 'Free', duration=duration)
+        Utilities.send_message(uid, uid, Utilities.format_border(uid, 'pending_review', text), build_back_keyboard(uid))
+
+    # تنظيف الجلسة
+    if uid in upload_sessions:
+        del upload_sessions[uid]
+
+def hours_step_zip(msg, prompt_id, uid):
+    if Utilities.is_cancelled(uid):
+        Utilities.clear_cancel(uid)
+        return
+    Utilities.delete_messages(msg.chat.id, prompt_id, msg.message_id)
+    if not msg.text or not msg.text.strip().isdigit():
+        Utilities.send_message(msg.chat.id, uid, Utilities.format_border(uid, 'error', Utilities.get_text(uid, 'invalid_number')), build_back_keyboard(uid, "nav_upload"))
+        return
+    hours = int(msg.text.strip())
+    users = DatabaseManager.get_users()
+    pts = users.get(str(uid), {}).get('points', 0)
+    if hours < 1:
+        Utilities.send_message(msg.chat.id, uid, Utilities.format_border(uid, 'error', Utilities.get_text(uid, 'min_hour')), build_back_keyboard(uid, "nav_upload"))
+        return
+    if hours > pts:
+        Utilities.send_message(msg.chat.id, uid, Utilities.format_border(uid, 'insufficient_points_short', Utilities.get_text(uid, 'insufficient_points', required=hours, available=pts)), build_back_keyboard(uid, "nav_wallet"))
+        return
+    session = upload_sessions.get(uid)
+    if not session:
+        Utilities.send_message(msg.chat.id, uid, Utilities.format_border(uid, 'error', "Session expired."), build_back_keyboard(uid, "nav_upload"))
+        return
+    complete_upload_zip(uid, session['file_id'], session['h_type'], hours, uid, session['main_file'])
 
 def hours_step(msg, doc, prompt_id, uid):
     if Utilities.is_cancelled(uid):
@@ -2366,7 +2598,8 @@ def complete_upload(doc, user_id, h_type, hours, uid):
         'type': h_type,
         'status': 'pending',
         'created_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        'hours': hours
+        'hours': hours,
+        'file_format': 'py'  # دلالة على ملف واحد
     }
     DatabaseManager.save_files(files)
     settings = DatabaseManager.get_settings()
@@ -2514,13 +2747,18 @@ def file_panel(call, fid, uid):
         bot.answer_callback_query(call.id, Utilities.get_text(uid, 'file_not_found'))
         return
     f = files[fid]
-    content = EncryptionManager.load_encrypted_file(fid)
+    is_zip = f.get('file_format') == 'zip'
+    content = None
     preview = "Unable to read file"
-    if content:
-        safe = escape(content[:1000])
-        if len(safe) > 3000:
-            safe = safe[:3000] + "\n..."
-        preview = f"<pre><code class='language-python'>{safe}</code></pre>"
+    if not is_zip:
+        content = EncryptionManager.load_encrypted_file(fid)
+        if content:
+            safe = escape(content[:1000])
+            if len(safe) > 3000:
+                safe = safe[:3000] + "\n..."
+            preview = f"<pre><code class='language-python'>{safe}</code></pre>"
+    else:
+        preview = f"Zip archive containing: {f.get('main_file', '?')}"
     running = fid in active_processes and active_processes[fid].poll() is None
     hrs = "Unlimited"
     if f.get('type') == 'free' and fid in process_hours:
@@ -2535,10 +2773,11 @@ def file_panel(call, fid, uid):
         Utilities.create_button(Utilities.get_text(uid, 'stop') if running else Utilities.get_text(uid, 'start'), f"toggle_{fid}", uid),
         Utilities.create_button(Utilities.get_text(uid, 'terminal'), f"term_{fid}", uid)
     )
-    kb.add(
-        Utilities.create_button(Utilities.get_text(uid, 'change_token'), f"chtoken_{fid}", uid),
-        Utilities.create_button(Utilities.get_text(uid, 'token_info'), f"tokinfo_{fid}", uid)
-    )
+    if not is_zip:
+        kb.add(
+            Utilities.create_button(Utilities.get_text(uid, 'change_token'), f"chtoken_{fid}", uid),
+            Utilities.create_button(Utilities.get_text(uid, 'token_info'), f"tokinfo_{fid}", uid)
+        )
     kb.add(
         Utilities.create_button(Utilities.get_text(uid, 'download'), f"dl_{fid}", uid),
         Utilities.create_button(Utilities.get_text(uid, 'delete'), f"delc_{fid}", uid)
@@ -2623,6 +2862,25 @@ def download_file(call, fid, uid):
     if fid not in files:
         bot.answer_callback_query(call.id, Utilities.get_text(uid, 'file_not_found'))
         return
+    f = files[fid]
+    is_zip = f.get('file_format') == 'zip'
+    if is_zip:
+        encrypted_data = EncryptionManager.load_encrypted_binary_file(fid)
+        if not encrypted_data:
+            bot.answer_callback_query(call.id, Utilities.get_text(uid, 'download_failed'), show_alert=True)
+            return
+        try:
+            thumb = Utilities.get_thumb()
+            if thumb:
+                with open(thumb, 'rb') as t:
+                    bot.send_document(call.message.chat.id, ('archive.zip', encrypted_data, 'application/zip'), thumb=t, caption=f.get('file_name'))
+            else:
+                bot.send_document(call.message.chat.id, ('archive.zip', encrypted_data, 'application/zip'), caption=f.get('file_name'))
+            bot.answer_callback_query(call.id, Utilities.get_text(uid, 'downloaded'))
+        except:
+            bot.answer_callback_query(call.id, Utilities.get_text(uid, 'download_failed'), show_alert=True)
+        return
+
     content = EncryptionManager.load_encrypted_file(fid)
     if not content:
         bot.answer_callback_query(call.id, Utilities.get_text(uid, 'download_failed'), show_alert=True)
@@ -2635,9 +2893,9 @@ def download_file(call, fid, uid):
         with open(temp_path, 'rb') as f:
             if thumb:
                 with open(thumb, 'rb') as t:
-                    bot.send_document(call.message.chat.id, f, thumb=t, caption=f"{files[fid]['file_name']}", parse_mode="HTML")
+                    bot.send_document(call.message.chat.id, f, thumb=t, caption=f"{f.get('file_name')}", parse_mode="HTML")
             else:
-                bot.send_document(call.message.chat.id, f, caption=f"{files[fid]['file_name']}", parse_mode="HTML")
+                bot.send_document(call.message.chat.id, f, caption=f"{f.get('file_name')}", parse_mode="HTML")
         os.remove(temp_path)
         bot.answer_callback_query(call.id, Utilities.get_text(uid, 'downloaded'))
     except:
@@ -2741,16 +2999,37 @@ def library_step(msg, prompt_id, uid):
     Utilities.delete_messages(msg.chat.id, prompt_id, msg.message_id)
     if not msg.text:
         return
-    lib = msg.text.strip()
-    m = bot.send_message(msg.chat.id, Utilities.format_border(uid, 'library_install', Utilities.get_text(uid, 'library_install', lib=escape(lib))))
+    libs_input = msg.text.strip()
+    libs = [lib.strip() for lib in re.split(r'[,\s]+', libs_input) if lib.strip()]
+    if not libs:
+        return
+    m = bot.send_message(msg.chat.id, Utilities.format_border(uid, 'library_install', Utilities.get_text(uid, 'library_install', lib=escape(', '.join(libs)))))
     Utilities.save_message(msg.chat.id, m.message_id)
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", lib], timeout=120)
-        text = Utilities.get_text(uid, 'library_installed', lib=escape(lib))
-    except subprocess.TimeoutExpired:
-        text = Utilities.get_text(uid, 'library_timeout', lib=escape(lib))
-    except:
-        text = Utilities.get_text(uid, 'library_failed', lib=escape(lib))
+    installed = []
+    failed = []
+    for lib in libs:
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", lib], timeout=120)
+            installed.append(lib)
+        except subprocess.TimeoutExpired:
+            failed.append(lib)
+        except Exception as e:
+            failed.append(lib)
+
+    settings = DatabaseManager.get_settings()
+    saved = settings.get('installed_libraries', [])
+    for lib in installed:
+        if lib not in saved:
+            saved.append(lib)
+    settings['installed_libraries'] = saved
+    DatabaseManager.save_settings(settings)
+
+    if failed:
+        text = Utilities.get_text(uid, 'library_failed', lib=escape(', '.join(failed)))
+        if installed:
+            text += "\n" + Utilities.get_text(uid, 'library_installed', lib=escape(', '.join(installed)))
+    else:
+        text = Utilities.get_text(uid, 'library_installed', lib=escape(', '.join(installed)))
     bot.edit_message_text(Utilities.format_border(uid, 'library_install', text), msg.chat.id, m.message_id, parse_mode="HTML", reply_markup=build_back_keyboard(uid))
 
 def broadcast_step(msg, prompt_id, uid):
