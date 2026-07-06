@@ -92,6 +92,25 @@ RESOURCE_LIMITS = {
     'max_log_size_mb': 5
 }
 
+# ========== بداية نظام التخزين المؤقت لتسريع الأداء ==========
+_cache = {
+    'users': None,
+    'files': None,
+    'settings': None,
+    'store': None,
+    'admins': None,
+    'market': None,
+    'security': None
+}
+_cache_lock = threading.Lock()
+
+def _invalidate_cache(*keys):
+    with _cache_lock:
+        for k in keys:
+            _cache[k] = None
+
+# ============================================================
+
 class DatabaseManager:
     @staticmethod
     def _get_collection(name):
@@ -99,9 +118,15 @@ class DatabaseManager:
 
     @staticmethod
     def get_users():
+        with _cache_lock:
+            if _cache['users'] is not None:
+                return _cache['users']
         with db_lock:
             doc = DatabaseManager._get_collection('users').find_one({"_id": "users_data"})
-        return doc.get("users", {}) if doc else {}
+        data = doc.get("users", {}) if doc else {}
+        with _cache_lock:
+            _cache['users'] = data
+        return data
 
     @staticmethod
     def save_users(data):
@@ -111,12 +136,20 @@ class DatabaseManager:
                 {"$set": {"users": data}},
                 upsert=True
             )
+        with _cache_lock:
+            _cache['users'] = data
 
     @staticmethod
     def get_files():
+        with _cache_lock:
+            if _cache['files'] is not None:
+                return _cache['files']
         with db_lock:
             doc = DatabaseManager._get_collection('files').find_one({"_id": "files_data"})
-        return doc.get("files", {}) if doc else {}
+        data = doc.get("files", {}) if doc else {}
+        with _cache_lock:
+            _cache['files'] = data
+        return data
 
     @staticmethod
     def save_files(data):
@@ -126,12 +159,20 @@ class DatabaseManager:
                 {"$set": {"files": data}},
                 upsert=True
             )
+        with _cache_lock:
+            _cache['files'] = data
 
     @staticmethod
     def get_settings():
+        with _cache_lock:
+            if _cache['settings'] is not None:
+                return _cache['settings']
         with db_lock:
             doc = DatabaseManager._get_collection('settings').find_one({"_id": "settings_data"})
-        return doc.get("settings", {}) if doc else {}
+        data = doc.get("settings", {}) if doc else {}
+        with _cache_lock:
+            _cache['settings'] = data
+        return data
 
     @staticmethod
     def save_settings(data):
@@ -141,12 +182,20 @@ class DatabaseManager:
                 {"$set": {"settings": data}},
                 upsert=True
             )
+        with _cache_lock:
+            _cache['settings'] = data
 
     @staticmethod
     def get_store():
+        with _cache_lock:
+            if _cache['store'] is not None:
+                return _cache['store']
         with db_lock:
             doc = DatabaseManager._get_collection('store').find_one({"_id": "store_data"})
-        return doc.get("store", {}) if doc else {}
+        data = doc.get("store", {}) if doc else {}
+        with _cache_lock:
+            _cache['store'] = data
+        return data
 
     @staticmethod
     def save_store(data):
@@ -156,14 +205,23 @@ class DatabaseManager:
                 {"$set": {"store": data}},
                 upsert=True
             )
+        with _cache_lock:
+            _cache['store'] = data
 
     @staticmethod
     def get_admins():
+        with _cache_lock:
+            if _cache['admins'] is not None:
+                return _cache['admins']
         with db_lock:
             doc = DatabaseManager._get_collection('admins').find_one({"_id": "admins_data"})
         if not doc:
-            return [ADMIN_ID]
-        return doc.get("admins", [ADMIN_ID])
+            data = [ADMIN_ID]
+        else:
+            data = doc.get("admins", [ADMIN_ID])
+        with _cache_lock:
+            _cache['admins'] = data
+        return data
 
     @staticmethod
     def save_admins(data):
@@ -173,12 +231,20 @@ class DatabaseManager:
                 {"$set": {"admins": data}},
                 upsert=True
             )
+        with _cache_lock:
+            _cache['admins'] = data
 
     @staticmethod
     def get_market():
+        with _cache_lock:
+            if _cache['market'] is not None:
+                return _cache['market']
         with db_lock:
             doc = DatabaseManager._get_collection('market').find_one({"_id": "market_data"})
-        return doc.get("market", {}) if doc else {}
+        data = doc.get("market", {}) if doc else {}
+        with _cache_lock:
+            _cache['market'] = data
+        return data
 
     @staticmethod
     def save_market(data):
@@ -188,12 +254,20 @@ class DatabaseManager:
                 {"$set": {"market": data}},
                 upsert=True
             )
+        with _cache_lock:
+            _cache['market'] = data
 
     @staticmethod
     def get_security():
+        with _cache_lock:
+            if _cache['security'] is not None:
+                return _cache['security']
         with db_lock:
             doc = DatabaseManager._get_collection('security').find_one({"_id": "security_data"})
-        return doc.get("security", {}) if doc else {}
+        data = doc.get("security", {}) if doc else {}
+        with _cache_lock:
+            _cache['security'] = data
+        return data
 
     @staticmethod
     def save_security(data):
@@ -203,6 +277,8 @@ class DatabaseManager:
                 {"$set": {"security": data}},
                 upsert=True
             )
+        with _cache_lock:
+            _cache['security'] = data
 
 class EncryptionManager:
     @staticmethod
@@ -395,6 +471,11 @@ class ProcessManager:
             return None
 
 class Utilities:
+    # تخزين مؤقت لنتائج فحص الاشتراك
+    _sub_cache = {}
+    _sub_cache_lock = threading.Lock()
+    SUB_CACHE_TTL = 30  # ثانية
+
     @staticmethod
     def gen_id(length=8):
         return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
@@ -542,18 +623,30 @@ class Utilities:
     def check_subscription(user_id):
         if user_id == ADMIN_ID or Utilities.is_admin(user_id):
             return True
+        # استخدام التخزين المؤقت لتجنب طلبات API المتكررة
+        now = time.time()
+        with Utilities._sub_cache_lock:
+            cached = Utilities._sub_cache.get(user_id)
+            if cached and (now - cached['time']) < Utilities.SUB_CACHE_TTL:
+                return cached['result']
         settings = DatabaseManager.get_settings()
         channels = settings.get('channels', [])
         if not channels:
-            return True
-        try:
-            for ch in channels:
-                member = bot.get_chat_member(ch["username"], user_id)
-                if member.status in ['left', 'kicked']:
-                    return False
-            return True
-        except:
-            return True
+            result = True
+        else:
+            try:
+                for ch in channels:
+                    member = bot.get_chat_member(ch["username"], user_id)
+                    if member.status in ['left', 'kicked']:
+                        result = False
+                        break
+                else:
+                    result = True
+            except:
+                result = True
+        with Utilities._sub_cache_lock:
+            Utilities._sub_cache[user_id] = {'result': result, 'time': now}
+        return result
 
     @staticmethod
     def is_admin(user_id):
@@ -1175,6 +1268,7 @@ def handle_callback(call):
         uid = call.from_user.id
         cid = call.message.chat.id
         data = call.data
+        # سيتم جلب البيانات من الذاكرة المؤقتة، لذا لا يوجد حمل إضافي
         users = DatabaseManager.get_users()
         settings = DatabaseManager.get_settings()
         if settings.get('bot_locked', False) and not Utilities.is_admin(uid):
